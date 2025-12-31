@@ -307,11 +307,11 @@ class MotionGeneration(torch.nn.Module):
             k3d = torch.zeros(B, L, nj, 3, device=device)
 
         return dict(
-            latent_denorm=latent_denorm,  # (B, L, 201)
-            keypoints3d=k3d,  # (B, L, J, 3)
-            rot6d=rot6d_smooth,  # (B, L, J, 6)
-            transl=transl_smooth,  # (B, L, 3)
-            root_rotations_mat=root_rotmat_smooth,  # (B, L, 3, 3)
+            latent_denorm=latent_denorm.cpu().detach(),  # (B, L, 201)
+            keypoints3d=k3d.cpu().detach(),  # (B, L, J, 3)
+            rot6d=rot6d_smooth.cpu().detach(),  # (B, L, J, 6)
+            transl=transl_smooth.cpu().detach(),  # (B, L, 3)
+            root_rotations_mat=root_rotmat_smooth.cpu().detach(),  # (B, L, 3, 3)
         )
 
     @staticmethod

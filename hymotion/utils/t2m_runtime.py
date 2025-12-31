@@ -310,6 +310,8 @@ class T2MRuntime:
                 )
         finally:
             self._release_pipeline(pi)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         ts = _now()
         save_data, base_filename = save_visualization_data(
