@@ -1,11 +1,12 @@
 import os
 import sys
-import json
 import uuid
 import time
 import numpy as np
 import torch
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
+
+import comfy.model_management as model_management
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -27,15 +28,46 @@ def get_timestamp():
     ms = int((t - int(t)) * 1000)
     return time.strftime("%Y%m%d_%H%M%S", time.localtime(t)) + f"{ms:03d}"
 
-class HYMotionPipeline:
-    def __init__(self, pipeline, device, config_path, fbx_converter=None):
-        self.pipeline = pipeline
-        self.device = device
-        self.config_path = config_path
-        self.fbx_converter = fbx_converter
+
+class HYMotionLLMWrapper:
+    """LLM model wrapper"""
+    def __init__(self, model, tokenizer, llm_type="qwen3", max_length=512, crop_start=0):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.llm_type = llm_type
+        self.max_length = max_length
+        self.crop_start = crop_start
+        self.hidden_size = model.config.hidden_size if hasattr(model, 'config') else 4096
+
+
+class HYMotionNetworkWrapper:
+    """Diffusion Network wrapper"""
+    def __init__(self, network, config, mean, std, body_model=None):
+        self.network = network
+        self.config = config
+        self.mean = mean
+        self.std = std
+        self.body_model = body_model
+
+
+class HYMotionConditioning:
+    """Text encoding result"""
+    def __init__(self, vtxt_raw, ctxt_raw, ctxt_length, text: List[str]):
+        self.vtxt_raw = vtxt_raw
+        self.ctxt_raw = ctxt_raw
+        self.ctxt_length = ctxt_length
+        self.text = text
+
+    def to_hidden_state_dict(self):
+        return {
+            "text_vec_raw": self.vtxt_raw,
+            "text_ctxt_raw": self.ctxt_raw,
+            "text_ctxt_raw_length": self.ctxt_length,
+        }
 
 
 class HYMotionData:
+    """Motion output data"""
     def __init__(self, output_dict: Dict[str, Any], text: str, duration: float, seeds: List[int]):
         self.output_dict = output_dict
         self.text = text
@@ -43,145 +75,394 @@ class HYMotionData:
         self.seeds = seeds
         self.batch_size = output_dict["keypoints3d"].shape[0] if "keypoints3d" in output_dict else 1
 
-class HYMotionLoadModel:
+
+# ============================================================================
+# Node 1a: HYMotion Load LLM (HuggingFace)
+# ============================================================================
+
+class HYMotionLoadLLM:
+    """Load Qwen3 LLM with quantization support"""
     @classmethod
     def INPUT_TYPES(s):
-        model_options = ["HY-Motion-1.0", "HY-Motion-1.0-Lite"]
-        quantization_options = ["none", "int8", "int4"]
-
         return {
             "required": {
-                "model_name": (model_options, {"default": "HY-Motion-1.0-Lite"}),
-                "device": (["cuda", "cpu"], {"default": "cuda"}),
-                "quantization": (quantization_options, {"default": "none"}),
+                "quantization": (["none", "int8", "int4"], {"default": "none"}),
             },
         }
 
-    RETURN_TYPES = ("HYMOTION_PIPE",)
-    RETURN_NAMES = ("pipeline",)
-    FUNCTION = "load_model"
-    CATEGORY = "HY-Motion"
+    RETURN_TYPES = ("HYMOTION_LLM",)
+    RETURN_NAMES = ("llm",)
+    FUNCTION = "load_llm"
+    CATEGORY = "HY-Motion/Loaders"
 
-    def load_model(self, model_name, device, quantization="none"):
+    def load_llm(self, quantization="none"):
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+
+        local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
+        model_path = local_path if os.path.exists(local_path) else "Qwen/Qwen3-8B"
+
+        print(f"[HY-Motion] Loading LLM: {model_path}, quantization={quantization}")
+
+        load_kwargs = {"low_cpu_mem_usage": True}
+        if quantization == "int8":
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            load_kwargs["device_map"] = "auto"
+        elif quantization == "int4":
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            load_kwargs["device_map"] = "auto"
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="right")
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        model = model.eval().requires_grad_(False)
+
+        # Compute crop_start
+        template = [
+            {"role": "system", "content": f"{PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION}"},
+            {"role": "user", "content": "{}"},
+        ]
+        crop_start = self._compute_crop_start(tokenizer, template)
+
+        if quantization == "none":
+            device = model_management.get_torch_device()
+            model = model.to(device)
+
+        wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
+        print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
+        return (wrapper,)
+
+    def _compute_crop_start(self, tokenizer, template) -> int:
+        def _find_subseq(a, b):
+            for i in range(len(a) - len(b) + 1):
+                if a[i:i + len(b)] == b:
+                    return i
+            return -1
+
+        marker = "<BOC>"
+        msgs = [{"role": "system", "content": template[0]['content']}, {"role": "user", "content": marker}]
+        s = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+        full_ids = tokenizer(s, return_tensors="pt", add_special_tokens=True)["input_ids"][0].tolist()
+        marker_ids = tokenizer(marker, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+        pos = _find_subseq(full_ids, marker_ids)
+        return pos if pos >= 0 else max(0, len(full_ids) - 1)
+
+
+# ============================================================================
+# Node 1b: HYMotion Load LLM GGUF
+# ============================================================================
+
+class HYMotionLoadLLMGGUF:
+    """Load Qwen3 LLM from GGUF file
+
+    Supports loading GGUF quantized models via:
+    1. transformers native GGUF support (recommended, requires transformers>=4.40)
+
+    Place GGUF files in: ComfyUI/models/HY-Motion/ckpts/GGUF/
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        # Scan for GGUF files
+        gguf_files = ["(select file)"]
+        gguf_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF")
+        if os.path.exists(gguf_dir):
+            for f in os.listdir(gguf_dir):
+                if f.endswith(".gguf"):
+                    gguf_files.append(f)
+
+        llm_gguf_dir = os.path.join(COMFY_MODELS_DIR, "llm", "GGUF")
+        if os.path.exists(llm_gguf_dir):
+            for f in os.listdir(llm_gguf_dir):
+                if f.endswith(".gguf") and "qwen" in f.lower():
+                    gguf_files.append(f"llm/GGUF/{f}")
+
+        return {
+            "required": {
+                "gguf_file": (gguf_files, {"default": "(select file)"}),
+            },
+        }
+
+    RETURN_TYPES = ("HYMOTION_LLM",)
+    RETURN_NAMES = ("llm",)
+    FUNCTION = "load_llm_gguf"
+    CATEGORY = "HY-Motion/Loaders"
+
+    def load_llm_gguf(self, gguf_file):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+
+        # Determine the actual path
+        if gguf_file == "(select file)":
+            raise ValueError("Please select a GGUF file")
+
+        if gguf_file.startswith("llm/GGUF/"):
+            gguf_dir = os.path.join(COMFY_MODELS_DIR, "llm", "GGUF")
+            gguf_filename = os.path.basename(gguf_file)
+        else:
+            gguf_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF")
+            gguf_filename = gguf_file
+
+        gguf_path = os.path.join(gguf_dir, gguf_filename)
+        if not os.path.exists(gguf_path):
+            raise FileNotFoundError(f"GGUF file not found: {gguf_path}")
+
+        print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}")
+
+        # Check transformers version for native GGUF support
+        try:
+            import transformers
+            tf_version = tuple(map(int, transformers.__version__.split('.')[:2]))
+            has_native_gguf = tf_version >= (4, 40)
+        except:
+            has_native_gguf = False
+
+        if has_native_gguf:
+            tokenizer_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
+            if not os.path.exists(tokenizer_path):
+                tokenizer_path = "Qwen/Qwen3-8B"
+
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right")
+
+            model = AutoModelForCausalLM.from_pretrained(
+                gguf_dir,
+                gguf_file=gguf_filename,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+            )
+            model = model.eval().requires_grad_(False)
+        else:
+            print("[HY-Motion] transformers<4.40, GGUF not supported")
+            raise NotImplementedError(
+                "GGUF support requires transformers>=4.40. "
+                "Please upgrade: pip install -U transformers>=4.40"
+            )
+
+        # Compute crop_start
+        template = [
+            {"role": "system", "content": f"{PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION}"},
+            {"role": "user", "content": "{}"},
+        ]
+        crop_start = self._compute_crop_start(tokenizer, template)
+
+        wrapper = HYMotionLLMWrapper(
+            model=model,
+            tokenizer=tokenizer,
+            llm_type="qwen3_gguf",
+            max_length=512,
+            crop_start=crop_start
+        )
+        print(f"[HY-Motion] GGUF LLM loaded, hidden_size={wrapper.hidden_size}")
+        return (wrapper,)
+
+    def _compute_crop_start(self, tokenizer, template) -> int:
+        def _find_subseq(a, b):
+            for i in range(len(a) - len(b) + 1):
+                if a[i:i + len(b)] == b:
+                    return i
+            return -1
+
+        marker = "<BOC>"
+        msgs = [{"role": "system", "content": template[0]['content']}, {"role": "user", "content": marker}]
+        try:
+            s = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+        except TypeError:
+            # Some tokenizers don't support enable_thinking
+            s = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+        full_ids = tokenizer(s, return_tensors="pt", add_special_tokens=True)["input_ids"][0].tolist()
+        marker_ids = tokenizer(marker, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+        pos = _find_subseq(full_ids, marker_ids)
+        return pos if pos >= 0 else max(0, len(full_ids) - 1)
+
+
+# ============================================================================
+# Node 2: HYMotion Load Network
+# ============================================================================
+
+class HYMotionLoadNetwork:
+    """Load Motion Diffusion Network"""
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (["HY-Motion-1.0", "HY-Motion-1.0-Lite"], {"default": "HY-Motion-1.0-Lite"}),
+            },
+        }
+
+    RETURN_TYPES = ("HYMOTION_NET",)
+    RETURN_NAMES = ("network",)
+    FUNCTION = "load_network"
+    CATEGORY = "HY-Motion/Loaders"
+
+    def load_network(self, model_name):
         import yaml
         from .hymotion.utils.loaders import load_object
+        from .hymotion.pipeline.body_model import WoodenMesh
 
         model_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "tencent", model_name)
         config_path = os.path.join(model_dir, "config.yml")
         ckpt_path = os.path.join(model_dir, "latest.ckpt")
 
         if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config file not found: {config_path}")
+            raise FileNotFoundError(f"Config not found: {config_path}")
 
-        print(f"[HY-Motion] Loading model config: {config_path}")
-        print(f"[HY-Motion] Quantization: {quantization}")
+        print(f"[HY-Motion] Loading network: {config_path}")
 
         with open(config_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
 
-        # Override quantization in text_encoder_cfg
-        if "train_pipeline_args" in config and "text_encoder_cfg" in config["train_pipeline_args"]:
-            config["train_pipeline_args"]["text_encoder_cfg"]["quantization"] = quantization if quantization != "none" else None
+        network = load_object(config["network_module"], config["network_module_args"])
+        network.eval()
 
-        pipeline = load_object(
-            config["train_pipeline"],
-            config["train_pipeline_args"],
-            network_module=config["network_module"],
-            network_module_args=config["network_module_args"],
-        )
+        # Load weights
+        mean = torch.zeros(201)
+        std = torch.ones(201)
+        null_vtxt_feat = torch.randn(1, 1, 768)
+        null_ctxt_input = torch.randn(1, 1, 4096)
 
-        allow_empty_ckpt = not os.path.exists(ckpt_path)
-        if allow_empty_ckpt:
-            print(f"[HY-Motion] Warning: Checkpoint not found at {ckpt_path}, using random initialized weights")
+        if os.path.exists(ckpt_path):
+            print(f"[HY-Motion] Loading checkpoint: {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint["model_state_dict"]
 
-        model_dir = os.path.dirname(ckpt_path)
+            network_state = {k.replace("motion_transformer.", ""): v
+                           for k, v in state_dict.items() if k.startswith("motion_transformer.")}
+            network.load_state_dict(network_state, strict=False)
+
+            mean = state_dict.get("mean", mean)
+            std = state_dict.get("std", std)
+            null_vtxt_feat = state_dict.get("null_vtxt_feat", null_vtxt_feat)
+            null_ctxt_input = state_dict.get("null_ctxt_input", null_ctxt_input)
+
+        # Load from stats directory
         stats_dir = os.path.join(model_dir, "stats")
         if not os.path.exists(stats_dir):
-            plugin_stats = os.path.join(CURRENT_DIR, "HY-Motion-1.0", "stats")
-            if os.path.exists(plugin_stats):
-                stats_dir = plugin_stats
-                print(f"[HY-Motion] Using stats from: {stats_dir}", flush=True)
-            else:
-                stats_dir = None
-                print(f"[HY-Motion] WARNING: stats directory not found! Mean/Std will not be loaded.", flush=True)
-        else:
-            print(f"[HY-Motion] Using stats from: {stats_dir}", flush=True)
+            stats_dir = os.path.join(CURRENT_DIR, "HY-Motion-1.0", "stats")
+        if os.path.exists(stats_dir):
+            mean_path = os.path.join(stats_dir, "Mean.npy")
+            std_path = os.path.join(stats_dir, "Std.npy")
+            if os.path.exists(mean_path) and os.path.exists(std_path):
+                mean = torch.from_numpy(np.load(mean_path)).float()
+                std = torch.from_numpy(np.load(std_path)).float()
 
-        pipeline.load_in_demo(
-            ckpt_path,
-            stats_dir,
-            build_text_encoder=True,
-            allow_empty_ckpt=allow_empty_ckpt,
-        )
+        device = model_management.get_torch_device()
+        network = network.to(device)
+        mean = mean.to(device)
+        std = std.to(device)
 
-        target_device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
-        pipeline.to(target_device)
-        pipeline.eval()
+        wrapper = HYMotionNetworkWrapper(network=network, config=config, mean=mean, std=std, body_model=WoodenMesh())
+        wrapper.train_frames = 360
+        wrapper.output_mesh_fps = 30
+        wrapper.validation_steps = 50
+        wrapper.input_dim = config["network_module_args"].get("input_dim", 201)
+        wrapper.null_vtxt_feat = null_vtxt_feat.to(device)
+        wrapper.null_ctxt_input = null_ctxt_input.to(device)
 
-        print(f"[HY-Motion] Model loaded successfully, device: {target_device}", flush=True)
+        print("[HY-Motion] Network loaded")
+        return (wrapper,)
 
-        import sys
-        if hasattr(pipeline, 'mean') and hasattr(pipeline, 'std'):
-            print(f"[HY-Motion] DEBUG: mean shape={pipeline.mean.shape}, mean range=[{pipeline.mean.min():.4f}, {pipeline.mean.max():.4f}]", flush=True)
-            print(f"[HY-Motion] DEBUG: std shape={pipeline.std.shape}, std range=[{pipeline.std.min():.4f}, {pipeline.std.max():.4f}]", flush=True)
-        else:
-            print(f"[HY-Motion] WARNING: mean/std not found in pipeline!", flush=True)
-        sys.stdout.flush()
 
-        pipe_obj = HYMotionPipeline(
-            pipeline=pipeline,
-            device=target_device,
-            config_path=config_path,
-        )
+# ============================================================================
+# Node 3: HYMotion Encode Text
+# ============================================================================
 
-        try:
-            import fbx
-            from .hymotion.utils.smplh2woodfbx import SMPLH2WoodFBX
-            plugin_dir = os.path.dirname(os.path.abspath(__file__))
-            template_fbx_path = os.path.join(plugin_dir, "assets", "wooden_models", "boy_Rigging_smplx_tex.fbx")
-            pipe_obj.fbx_converter = SMPLH2WoodFBX(template_fbx_path=template_fbx_path)
-            print(f"[HY-Motion] FBX converter loaded")
-        except ImportError:
-            print(f"[HY-Motion] FBX SDK not installed, FBX export disabled")
-        except Exception as e:
-            print(f"[HY-Motion] Failed to load FBX converter: {e}")
+class HYMotionEncodeText:
+    """Encode text - CLIP loaded internally, LLM passed externally"""
+    _clip_model = None
+    _clip_tokenizer = None
 
-        return (pipe_obj,)
-
-class HYMotionGenerate:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "pipeline": ("HYMOTION_PIPE",),
-                "text": ("STRING", {
-                    "default": "A person is walking forward.",
-                    "multiline": True,
-                }),
-                "duration": ("FLOAT", {
-                    "default": 3.0,
-                    "min": 0.5,
-                    "max": 12.0,
-                    "step": 0.1,
-                }),
-                "seed": ("INT", {
-                    "default": 42,
-                    "min": 0,
-                    "max": 0x7fffffff,
-                }),
+                "llm": ("HYMOTION_LLM",),
+                "text": ("STRING", {"default": "A person is walking forward.", "multiline": True}),
+            },
+        }
+
+    RETURN_TYPES = ("HYMOTION_COND",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "HY-Motion/Conditioning"
+
+    def _ensure_clip_loaded(self):
+        """Lazy load CLIP model"""
+        if HYMotionEncodeText._clip_model is None:
+            from transformers import CLIPTextModel, CLIPTokenizer
+            print("[HY-Motion] Loading CLIP (clip-vit-large-patch14)")
+
+            local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "clip-vit-large-patch14")
+            clip_path = local_path if os.path.exists(local_path) else "openai/clip-vit-large-patch14"
+
+            HYMotionEncodeText._clip_tokenizer = CLIPTokenizer.from_pretrained(clip_path, max_length=77)
+            HYMotionEncodeText._clip_model = CLIPTextModel.from_pretrained(clip_path)
+            HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.eval().requires_grad_(False)
+
+            device = model_management.get_torch_device()
+            HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.to(device)
+            print("[HY-Motion] CLIP loaded")
+
+    def encode(self, llm: HYMotionLLMWrapper, text: str):
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+
+        self._ensure_clip_loaded()
+
+        text_list = [text]
+        device = model_management.get_torch_device()
+
+        # CLIP encoding
+        enc = HYMotionEncodeText._clip_tokenizer(text_list, truncation=True, max_length=77, padding=True, return_tensors="pt")
+        clip_device = next(HYMotionEncodeText._clip_model.parameters()).device
+        out = HYMotionEncodeText._clip_model(input_ids=enc["input_ids"].to(clip_device), attention_mask=enc["attention_mask"].to(clip_device))
+        vtxt_raw = out.pooler_output.unsqueeze(1) if out.pooler_output is not None else out.last_hidden_state.mean(1, keepdim=True)
+        vtxt_raw = vtxt_raw.to(device)
+
+        # LLM encoding
+        template = [{"role": "system", "content": PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION}, {"role": "user", "content": "{}"}]
+        llm_text = [llm.tokenizer.apply_chat_template(
+            [{"role": "system", "content": template[0]['content']}, {"role": "user", "content": t}],
+            tokenize=False, add_generation_prompt=False, enable_thinking=False
+        ) for t in text_list]
+
+        max_length = llm.max_length + llm.crop_start
+        llm_enc = llm.tokenizer(llm_text, truncation=True, max_length=max_length, padding="max_length", return_tensors="pt")
+        llm_device = next(llm.model.parameters()).device
+
+        llm_out = llm.model(
+            input_ids=llm_enc["input_ids"].to(llm_device),
+            attention_mask=llm_enc["attention_mask"].to(llm_device),
+            output_hidden_states=True,
+        )
+
+        ctxt_raw = llm_out.hidden_states[-1][:, llm.crop_start:llm.crop_start + llm.max_length].contiguous().to(device)
+        ctxt_length = (llm_enc["attention_mask"].sum(dim=-1) - llm.crop_start).clamp(0, llm.max_length).to(device)
+
+        print(f"[HY-Motion] Encoded: vtxt={vtxt_raw.shape}, ctxt={ctxt_raw.shape}")
+        return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
+
+
+# ============================================================================
+# Node 4: HYMotion Generate
+# ============================================================================
+
+class HYMotionGenerate:
+    """Motion generation"""
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "network": ("HYMOTION_NET",),
+                "conditioning": ("HYMOTION_COND",),
+                "duration": ("FLOAT", {"default": 3.0, "min": 0.5, "max": 12.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0x7fffffff}),
             },
             "optional": {
-                "cfg_scale": ("FLOAT", {
-                    "default": 5.0,
-                    "min": 1.0,
-                    "max": 15.0,
-                    "step": 0.5,
-                }),
-                "num_samples": ("INT", {
-                    "default": 1,
-                    "min": 1,
-                    "max": 4,
-                }),
+                "cfg_scale": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 15.0, "step": 0.5}),
+                "num_samples": ("INT", {"default": 1, "min": 1, "max": 4}),
             }
         }
 
@@ -190,376 +471,304 @@ class HYMotionGenerate:
     FUNCTION = "generate"
     CATEGORY = "HY-Motion"
 
-    def generate(self, pipeline: HYMotionPipeline, text: str, duration: float,
-                 seed: int, cfg_scale: float = 5.0, num_samples: int = 1):
+    def generate(self, network: HYMotionNetworkWrapper, conditioning: HYMotionConditioning,
+                 duration: float, seed: int, cfg_scale: float = 5.0, num_samples: int = 1):
         import comfy.utils
+        from torchdiffeq import odeint
+        from .hymotion.pipeline.motion_diffusion import length_to_mask, randn_tensor
 
-        pipe = pipeline.pipeline
+        device = model_management.get_torch_device()
+        network.network = network.network.to(device)
 
+        length = min(max(int(duration * network.output_mesh_fps), 20), network.train_frames)
         seeds = [seed + i for i in range(num_samples)]
 
-        print(f"[HY-Motion] Starting generation: text='{text[:50]}...', duration={duration}s, seeds={seeds}")
+        print(f"[HY-Motion] Generating: {duration}s, length={length}, seeds={seeds}")
 
-        # Create progress bar
-        pbar = comfy.utils.ProgressBar(pipe.validation_steps)
+        vtxt_input = conditioning.vtxt_raw.to(device)
+        ctxt_input = conditioning.ctxt_raw.to(device)
+        ctxt_length = conditioning.ctxt_length.to(device)
 
-        def progress_callback(current, total):
-            pbar.update_absolute(current, total)
+        if vtxt_input.shape[0] == 1 and num_samples > 1:
+            vtxt_input = vtxt_input.repeat(num_samples, 1, 1)
+            ctxt_input = ctxt_input.repeat(num_samples, 1, 1)
+            ctxt_length = ctxt_length.repeat(num_samples)
+
+        ctxt_mask = length_to_mask(ctxt_length, ctxt_input.shape[1])
+        x_length = torch.LongTensor([length] * num_samples).to(device)
+        x_mask = length_to_mask(x_length, network.train_frames)
+
+        do_cfg = cfg_scale > 1.0
+        if do_cfg:
+            vtxt_input = torch.cat([network.null_vtxt_feat.expand_as(vtxt_input), vtxt_input], dim=0)
+            ctxt_input = torch.cat([network.null_ctxt_input.expand_as(ctxt_input), ctxt_input], dim=0)
+            ctxt_mask = torch.cat([ctxt_mask] * 2, dim=0)
+            x_mask = torch.cat([x_mask] * 2, dim=0)
+
+        pbar = comfy.utils.ProgressBar(network.validation_steps)
+        step = [0]
+
+        def fn(t, x):
+            x_in = torch.cat([x] * 2, dim=0) if do_cfg else x
+            pred = network.network(x=x_in, ctxt_input=ctxt_input, vtxt_input=vtxt_input,
+                                   timesteps=t.expand(x_in.shape[0]), x_mask_temporal=x_mask, ctxt_mask_temporal=ctxt_mask)
+            if do_cfg:
+                pred_u, pred_c = pred.chunk(2)
+                pred = pred_u + cfg_scale * (pred_c - pred_u)
+            step[0] += 1
+            pbar.update_absolute(step[0], network.validation_steps)
+            return pred
+
+        t = torch.linspace(0, 1, network.validation_steps + 1, device=device)
+        y0 = torch.cat([randn_tensor((1, network.train_frames, network.input_dim),
+                       generator=torch.Generator(device=device).manual_seed(s), device=device) for s in seeds])
 
         with torch.no_grad():
-            output_dict = pipe.generate(
-                text=text,
-                seed_input=seeds,
-                duration_slider=duration,
-                cfg_scale=cfg_scale,
-                progress_callback=progress_callback,
-            )
+            sampled = odeint(fn, y0, t, method="euler")[-1][:, :length]
 
-        import sys
-        if "rot6d" in output_dict:
-            rot6d = output_dict["rot6d"]
-            print(f"[HY-Motion] DEBUG: rot6d shape={rot6d.shape}, range=[{rot6d.min():.4f}, {rot6d.max():.4f}]", flush=True)
-        if "transl" in output_dict:
-            transl = output_dict["transl"]
-            print(f"[HY-Motion] DEBUG: transl shape={transl.shape}, range=[{transl.min():.4f}, {transl.max():.4f}]", flush=True)
-        sys.stdout.flush()
+        output_dict = self._decode(sampled, network)
+        print(f"[HY-Motion] Done")
+        return (HYMotionData(output_dict, conditioning.text[0], duration, seeds),)
 
-        motion_data = HYMotionData(
-            output_dict=output_dict,
-            text=text,
-            duration=duration,
-            seeds=seeds,
-        )
+    def _decode(self, latent, net):
+        from scipy.signal import savgol_filter
+        from .hymotion.utils.geometry import rot6d_to_rotation_matrix, rotation_matrix_to_rot6d, matrix_to_quaternion, quaternion_to_matrix, quaternion_fix_continuity
+        from .hymotion.utils.motion_process import smooth_rotation
 
-        print(f"[HY-Motion] Generation complete: batch_size={motion_data.batch_size}")
+        std = torch.where(net.std < 1e-3, torch.ones_like(net.std), net.std)
+        x = latent * std + net.mean
+        B, L = x.shape[:2]
 
-        return (motion_data,)
+        transl = x[..., :3].clone()
+        rot6d = torch.cat([x[..., 3:9].reshape(B, L, 1, 6), x[..., 9:9+126].reshape(B, L, 21, 6)], dim=2)
+
+        # Smooth rotations
+        RR = rot6d_to_rotation_matrix(rot6d)
+        qq = matrix_to_quaternion(RR)
+        qq = qq.moveaxis(1, 0).contiguous().view(L, -1, 4)
+        qq = quaternion_fix_continuity(qq).view(L, B, 22, 4).moveaxis(0, 1)
+        rot6d_s = rotation_matrix_to_rot6d(quaternion_to_matrix(torch.from_numpy(smooth_rotation(qq.cpu().numpy(), sigma=1.0)))).to(latent.device)
+
+        transl_np = transl.cpu().numpy()
+        for b in range(B):
+            for j in range(3):
+                transl_np[b, :, j] = savgol_filter(transl_np[b, :, j], 11, 5)
+        transl_s = torch.from_numpy(transl_np).to(latent.device)
+
+        k3d = None
+        if net.body_model:
+            # Run body_model on CPU (its internal tensors are on CPU)
+            rot6d_cpu = rot6d_s.cpu()
+            transl_cpu = transl_s.cpu()
+            k3d_list = []
+            vertices_list = []
+            with torch.no_grad():
+                for b in range(B):
+                    out = net.body_model.forward({"rot6d": rot6d_cpu[b], "trans": transl_cpu[b]})
+                    k3d_list.append(out["keypoints3d"])
+                    vertices_list.append(out["vertices"])
+            k3d = torch.stack(k3d_list, dim=0)
+            vertices = torch.stack(vertices_list, dim=0)
+            # Align to ground
+            min_y = vertices[..., 1].amin(dim=(1, 2), keepdim=True)
+            k3d = k3d.clone()
+            k3d[..., 1] -= min_y
+            transl_cpu = transl_cpu.clone()
+            transl_cpu[..., 1] -= min_y.squeeze(-1)
+            transl_s = transl_cpu
+        else:
+            k3d = torch.zeros(B, L, 22, 3)
+
+        return {"keypoints3d": k3d.cpu(), "rot6d": rot6d_s.cpu(), "transl": transl_s.cpu(),
+                "root_rotations_mat": rot6d_to_rotation_matrix(rot6d_s[:, :, 0].cpu()).cpu()}
+
+
+# ============================================================================
+# Node 5: HYMotion Preview
+# ============================================================================
 
 class HYMotionPreview:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "motion_data": ("HYMOTION_DATA",),
-                "sample_index": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 3,
-                }),
-                "frame_step": ("INT", {
-                    "default": 5,
-                    "min": 1,
-                    "max": 30,
-                }),
-                "image_size": ("INT", {
-                    "default": 512,
-                    "min": 256,
-                    "max": 1024,
-                    "step": 64,
-                }),
-            },
-        }
+        return {"required": {
+            "motion_data": ("HYMOTION_DATA",),
+            "sample_index": ("INT", {"default": 0, "min": 0, "max": 3}),
+            "frame_step": ("INT", {"default": 5, "min": 1, "max": 30}),
+            "image_size": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 64}),
+        }}
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("preview_frames",)
-    FUNCTION = "render_preview"
+    FUNCTION = "render"
     CATEGORY = "HY-Motion"
     OUTPUT_NODE = True
 
-    def render_preview(self, motion_data: HYMotionData, sample_index: int = 0,
-                       frame_step: int = 5, image_size: int = 512):
-        import torch
-        import numpy as np
+    def render(self, motion_data, sample_index=0, frame_step=5, image_size=512):
+        kpts = motion_data.output_dict.get("keypoints3d")
+        if kpts is None:
+            return (torch.zeros(1, image_size, image_size, 3),)
 
-        keypoints3d = motion_data.output_dict.get("keypoints3d")
-        if keypoints3d is None:
-            empty = torch.zeros(1, image_size, image_size, 3)
-            return (empty,)
+        kpts = kpts[min(sample_index, kpts.shape[0]-1)].cpu().numpy()
+        frames = [self._draw(kpts[i], image_size) for i in range(0, len(kpts), frame_step)]
+        return (torch.from_numpy(np.stack(frames)).float() / 255.0,)
 
-        if sample_index >= keypoints3d.shape[0]:
-            sample_index = 0
-
-        kpts = keypoints3d[sample_index].cpu().numpy()  # (L, J, 3)
-        num_frames = kpts.shape[0]
-
-        # Sample frames
-        frame_indices = list(range(0, num_frames, frame_step))
-        if len(frame_indices) == 0:
-            frame_indices = [0]
-
-        # Render each frame
-        images = []
-        for fi in frame_indices:
-            frame_kpts = kpts[fi]  # (J, 3)
-            img = self._render_skeleton_frame(frame_kpts, image_size)
-            images.append(img)
-
-        images_np = np.stack(images, axis=0)  # (B, H, W, C)
-        images_tensor = torch.from_numpy(images_np).float() / 255.0
-
-        return (images_tensor,)
-
-    def _render_skeleton_frame(self, kpts: np.ndarray, size: int) -> np.ndarray:
-        import numpy as np
-
+    def _draw(self, kpts, size):
         img = np.ones((size, size, 3), dtype=np.uint8) * 240
+        # Only use first 22 main joints for skeleton (ignore fingers)
+        bones = [(0,1),(1,4),(4,7),(7,10),(0,2),(2,5),(5,8),(8,11),(0,3),(3,6),(6,9),(9,12),(12,15),(9,13),(13,16),(16,18),(18,20),(9,14),(14,17),(17,19),(19,21)]
+        colors = [(255,100,100)]*4 + [(100,100,255)]*4 + [(100,200,100)]*5 + [(255,150,50)]*4 + [(50,150,255)]*4
 
-        # SMPL 22 joint bone connections (front view: X-Y coordinates)
-        bones = [
-            # Legs
-            (0, 1), (1, 4), (4, 7), (7, 10),  # Left leg: Pelvis -> L_Hip -> L_Knee -> L_Ankle -> L_Foot
-            (0, 2), (2, 5), (5, 8), (8, 11),  # Right leg: Pelvis -> R_Hip -> R_Knee -> R_Ankle -> R_Foot
-            # Spine
-            (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),  # Pelvis -> Spine1 -> Spine2 -> Spine3 -> Neck -> Head
-            # Arms
-            (9, 13), (13, 16), (16, 18), (18, 20),  # Left arm: Spine3 -> L_Collar -> L_Shoulder -> L_Elbow -> L_Wrist
-            (9, 14), (14, 17), (17, 19), (19, 21),  # Right arm: Spine3 -> R_Collar -> R_Shoulder -> R_Elbow -> R_Wrist
-        ]
+        # Only take first 22 joints for drawing
+        kpts_draw = kpts[:22] if len(kpts) > 22 else kpts
+        x, y = kpts_draw[:, 0], kpts_draw[:, 1]
+        cx, cy = (x.min()+x.max())/2, (y.min()+y.max())/2
+        scale = max(x.max()-x.min(), y.max()-y.min(), 0.1) * 1.3
 
-        # Use X (horizontal) and Y (vertical) for front view
-        x = kpts[:, 0]
-        y = kpts[:, 1]
+        def px(p): return int((p[0]-cx)/scale*size + size/2), int(size/2 - (p[1]-cy)/scale*size)
 
-        margin = 0.15
-        x_min, x_max = x.min(), x.max()
-        y_min, y_max = y.min(), y.max()
+        for (a, b), c in zip(bones, colors):
+            if a < len(kpts_draw) and b < len(kpts_draw):
+                p1, p2 = px(kpts_draw[a]), px(kpts_draw[b])
+                steps = max(abs(p2[0]-p1[0]), abs(p2[1]-p1[1]), 1) + 1
+                for t in np.linspace(0, 1, int(steps)):
+                    px_, py_ = int(p1[0]+t*(p2[0]-p1[0])), int(p1[1]+t*(p2[1]-p1[1]))
+                    for dx in range(-2, 3):
+                        for dy in range(-2, 3):
+                            if 0 <= px_+dx < size and 0 <= py_+dy < size:
+                                img[py_+dy, px_+dx] = c
 
-        x_range = max(x_max - x_min, 0.1)
-        y_range = max(y_max - y_min, 0.1)
-        scale = max(x_range, y_range) * (1 + 2 * margin)
-
-        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
-
-        def to_pixel(px, py):
-            px_norm = (px - cx) / scale + 0.5
-            py_norm = (py - cy) / scale + 0.5
-            return int(px_norm * size), int((1 - py_norm) * size)  # Flip Y for image coordinates
-
-        # Draw bones with different colors for different body parts
-        bone_colors = {
-            'leg_l': (255, 100, 100),   # Red for left leg
-            'leg_r': (100, 100, 255),   # Blue for right leg
-            'spine': (100, 200, 100),   # Green for spine
-            'arm_l': (255, 150, 50),    # Orange for left arm
-            'arm_r': (50, 150, 255),    # Cyan for right arm
-        }
-
-        for i, (b1, b2) in enumerate(bones):
-            if b1 < len(kpts) and b2 < len(kpts):
-                p1 = to_pixel(x[b1], y[b1])
-                p2 = to_pixel(x[b2], y[b2])
-                if i < 4:
-                    color = bone_colors['leg_l']
-                elif i < 8:
-                    color = bone_colors['leg_r']
-                elif i < 13:
-                    color = bone_colors['spine']
-                elif i < 17:
-                    color = bone_colors['arm_l']
-                else:
-                    color = bone_colors['arm_r']
-                self._draw_line(img, p1, p2, color, 3)
-
-        # Draw joints
-        for i in range(min(22, len(kpts))):
-            px, py = to_pixel(x[i], y[i])
-            if 0 <= px < size and 0 <= py < size:
-                radius = 5
-                for dx in range(-radius, radius + 1):
-                    for dy in range(-radius, radius + 1):
-                        if dx*dx + dy*dy <= radius*radius:
-                            nx, ny = px + dx, py + dy
-                            if 0 <= nx < size and 0 <= ny < size:
-                                img[ny, nx] = [50, 50, 50]
-
+        for i in range(len(kpts_draw)):
+            p = px(kpts_draw[i])
+            for dx in range(-4, 5):
+                for dy in range(-4, 5):
+                    if dx*dx+dy*dy <= 16 and 0 <= p[0]+dx < size and 0 <= p[1]+dy < size:
+                        img[p[1]+dy, p[0]+dx] = [50, 50, 50]
         return img
 
-    def _draw_line(self, img: np.ndarray, p1: tuple, p2: tuple, color: tuple, thickness: int):
-        x1, y1 = p1
-        x2, y2 = p2
-        h, w = img.shape[:2]
 
-        dx = abs(x2 - x1)
-        dy = abs(y2 - y1)
-        steps = max(dx, dy, 1)
-
-        for i in range(steps + 1):
-            t = i / steps
-            x = int(x1 + t * (x2 - x1))
-            y = int(y1 + t * (y2 - y1))
-
-            for tx in range(-thickness, thickness + 1):
-                for ty in range(-thickness, thickness + 1):
-                    nx, ny = x + tx, y + ty
-                    if 0 <= nx < w and 0 <= ny < h:
-                        img[ny, nx] = color
-
-
-class HYMotionExportFBX:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "pipeline": ("HYMOTION_PIPE",),
-                "motion_data": ("HYMOTION_DATA",),
-                "output_dir": ("STRING", {
-                    "default": "hymotion_fbx",
-                }),
-                "filename_prefix": ("STRING", {
-                    "default": "motion",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("fbx_paths",)
-    FUNCTION = "export_fbx"
-    CATEGORY = "HY-Motion"
-    OUTPUT_NODE = True
-
-    def export_fbx(self, pipeline: HYMotionPipeline, motion_data: HYMotionData,
-                   output_dir: str, filename_prefix: str):
-
-        if pipeline.fbx_converter is None:
-            return ("FBX SDK not installed, export unavailable",)
-
-        # Use ComfyUI's native output directory
-        full_output_dir = os.path.join(COMFY_OUTPUT_DIR, output_dir)
-        os.makedirs(full_output_dir, exist_ok=True)
-
-        output_dict = motion_data.output_dict
-        timestamp = get_timestamp()
-        unique_id = str(uuid.uuid4())[:8]
-
-        fbx_files = []
-
-        from .hymotion.pipeline.body_model import construct_smpl_data_dict
-
-        import sys
-        for batch_idx in range(motion_data.batch_size):
-            try:
-                rot6d = output_dict["rot6d"][batch_idx].clone()
-                transl = output_dict["transl"][batch_idx].clone()
-                print(f"[HY-Motion] batch {batch_idx}: rot6d shape={rot6d.shape}, transl shape={transl.shape}", flush=True)
-                print(f"[HY-Motion] batch {batch_idx}: rot6d range=[{rot6d.min():.4f}, {rot6d.max():.4f}]", flush=True)
-                print(f"[HY-Motion] batch {batch_idx}: transl range=[{transl.min():.4f}, {transl.max():.4f}]", flush=True)
-                smpl_data = construct_smpl_data_dict(rot6d, transl)
-                print(f"[HY-Motion] construct_smpl_data_dict success", flush=True)
-            except Exception as e:
-                import traceback
-                print(f"[HY-Motion] construct_smpl_data_dict failed: {e}", flush=True)
-                traceback.print_exc()
-                sys.stdout.flush()
-                continue
-
-            fbx_filename = f"{filename_prefix}_{timestamp}_{unique_id}_{batch_idx:03d}.fbx"
-            fbx_path = os.path.join(full_output_dir, fbx_filename)
-
-            try:
-                print(f"[HY-Motion] Converting to FBX: {fbx_path}", flush=True)
-                print(f"[HY-Motion] smpl_data keys: {smpl_data.keys()}", flush=True)
-                poses = smpl_data.get('poses')
-                trans = smpl_data.get('trans')
-                if poses is not None:
-                    print(f"[HY-Motion] poses shape: {poses.shape}, range=[{poses.min():.4f}, {poses.max():.4f}]", flush=True)
-                if trans is not None:
-                    print(f"[HY-Motion] trans shape: {trans.shape}, range=[{trans.min():.4f}, {trans.max():.4f}]", flush=True)
-                sys.stdout.flush()
-                success = pipeline.fbx_converter.convert_npz_to_fbx(smpl_data, fbx_path)
-                print(f"[HY-Motion] convert_npz_to_fbx returned: {success}")
-                if success:
-                    fbx_files.append(fbx_path)
-                    print(f"[HY-Motion] FBX export successful: {fbx_path}")
-
-                    txt_path = fbx_path.replace(".fbx", ".txt")
-                    with open(txt_path, "w", encoding="utf-8") as f:
-                        f.write(motion_data.text)
-                else:
-                    print(f"[HY-Motion] FBX export returned False")
-            except Exception as e:
-                import traceback
-                print(f"[HY-Motion] FBX export failed: {e}")
-                traceback.print_exc()
-
-        # Return paths relative to ComfyUI output directory
-        relative_paths = [os.path.relpath(p, COMFY_OUTPUT_DIR) for p in fbx_files]
-        result = "\n".join(relative_paths) if relative_paths else "Export failed"
-        return (result,)
-
+# ============================================================================
+# Node 6: HYMotion Save NPZ
+# ============================================================================
 
 class HYMotionSaveNPZ:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "motion_data": ("HYMOTION_DATA",),
-                "output_dir": ("STRING", {
-                    "default": "hymotion_npz",
-                }),
-                "filename_prefix": ("STRING", {
-                    "default": "motion",
-                }),
-            },
-        }
+        return {"required": {
+            "motion_data": ("HYMOTION_DATA",),
+            "output_dir": ("STRING", {"default": "hymotion_npz"}),
+            "filename_prefix": ("STRING", {"default": "motion"}),
+        }}
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("npz_paths",)
-    FUNCTION = "save_npz"
+    FUNCTION = "save"
     CATEGORY = "HY-Motion"
     OUTPUT_NODE = True
 
-    def save_npz(self, motion_data: HYMotionData, output_dir: str, filename_prefix: str):
-        import numpy as np
+    def save(self, motion_data, output_dir, filename_prefix):
+        out_dir = os.path.join(COMFY_OUTPUT_DIR, output_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        ts, uid = get_timestamp(), str(uuid.uuid4())[:8]
 
-        # Use ComfyUI's native output directory
-        full_output_dir = os.path.join(COMFY_OUTPUT_DIR, output_dir)
-        os.makedirs(full_output_dir, exist_ok=True)
+        paths = []
+        for i in range(motion_data.batch_size):
+            data = {k: motion_data.output_dict[k][i].cpu().numpy() if hasattr(motion_data.output_dict[k][i], 'cpu') else motion_data.output_dict[k][i]
+                    for k in ["keypoints3d", "rot6d", "transl", "root_rotations_mat"] if k in motion_data.output_dict}
+            data.update({"text": motion_data.text, "duration": motion_data.duration, "seed": motion_data.seeds[i] if i < len(motion_data.seeds) else 0})
+            path = os.path.join(out_dir, f"{filename_prefix}_{ts}_{uid}_{i:03d}.npz")
+            np.savez(path, **data)
+            paths.append(path)
+            print(f"[HY-Motion] Saved: {path}")
 
-        output_dict = motion_data.output_dict
-        timestamp = get_timestamp()
-        unique_id = str(uuid.uuid4())[:8]
+        return ("\n".join([os.path.relpath(p, COMFY_OUTPUT_DIR) for p in paths]),)
 
-        npz_files = []
 
-        for batch_idx in range(motion_data.batch_size):
-            data = {}
-            for key in ["keypoints3d", "rot6d", "transl", "root_rotations_mat"]:
-                if key in output_dict and output_dict[key] is not None:
-                    tensor = output_dict[key][batch_idx]
-                    if hasattr(tensor, 'cpu'):
-                        data[key] = tensor.cpu().numpy()
-                    else:
-                        data[key] = np.array(tensor)
+# ============================================================================
+# Node 7: HYMotion Export FBX
+# ============================================================================
 
-            data["text"] = motion_data.text
-            data["duration"] = motion_data.duration
-            data["seed"] = motion_data.seeds[batch_idx] if batch_idx < len(motion_data.seeds) else 0
+class HYMotionExportFBX:
+    _fbx_converter = None
 
-            npz_filename = f"{filename_prefix}_{timestamp}_{unique_id}_{batch_idx:03d}.npz"
-            npz_path = os.path.join(full_output_dir, npz_filename)
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "motion_data": ("HYMOTION_DATA",),
+            "output_dir": ("STRING", {"default": "hymotion_fbx"}),
+            "filename_prefix": ("STRING", {"default": "motion"}),
+        }}
 
-            np.savez(npz_path, **data)
-            npz_files.append(npz_path)
-            print(f"[HY-Motion] NPZ saved: {npz_path}")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("fbx_paths",)
+    FUNCTION = "export"
+    CATEGORY = "HY-Motion"
+    OUTPUT_NODE = True
 
-        # Return paths relative to ComfyUI output directory
-        relative_paths = [os.path.relpath(p, COMFY_OUTPUT_DIR) for p in npz_files]
-        result = "\n".join(relative_paths)
-        return (result,)
+    def export(self, motion_data, output_dir, filename_prefix):
+        from .hymotion.pipeline.body_model import construct_smpl_data_dict
 
+        # Lazy load FBX converter
+        if HYMotionExportFBX._fbx_converter is None:
+            try:
+                import fbx
+                from .hymotion.utils.smplh2woodfbx import SMPLH2WoodFBX
+                template_path = os.path.join(CURRENT_DIR, "assets", "wooden_models", "boy_Rigging_smplx_tex.fbx")
+                HYMotionExportFBX._fbx_converter = SMPLH2WoodFBX(template_fbx_path=template_path)
+                print("[HY-Motion] FBX converter loaded")
+            except ImportError:
+                return ("FBX SDK not installed",)
+            except Exception as e:
+                return (f"FBX converter error: {e}",)
+
+        out_dir = os.path.join(COMFY_OUTPUT_DIR, output_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        ts, uid = get_timestamp(), str(uuid.uuid4())[:8]
+
+        paths = []
+        for i in range(motion_data.batch_size):
+            try:
+                rot6d = motion_data.output_dict["rot6d"][i].clone()
+                transl = motion_data.output_dict["transl"][i].clone()
+                smpl_data = construct_smpl_data_dict(rot6d, transl)
+
+                path = os.path.join(out_dir, f"{filename_prefix}_{ts}_{uid}_{i:03d}.fbx")
+                success = HYMotionExportFBX._fbx_converter.convert_npz_to_fbx(smpl_data, path)
+
+                if success:
+                    paths.append(path)
+                    print(f"[HY-Motion] FBX saved: {path}")
+                    # Save text description
+                    txt_path = path.replace(".fbx", ".txt")
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        f.write(motion_data.text)
+            except Exception as e:
+                print(f"[HY-Motion] FBX export error: {e}")
+
+        if not paths:
+            return ("Export failed",)
+        return ("\n".join([os.path.relpath(p, COMFY_OUTPUT_DIR) for p in paths]),)
+
+
+# ============================================================================
+# Node Registration
+# ============================================================================
 
 NODE_CLASS_MAPPINGS = {
-    "HYMotionLoadModel": HYMotionLoadModel,
+    "HYMotionLoadLLM": HYMotionLoadLLM,
+    "HYMotionLoadLLMGGUF": HYMotionLoadLLMGGUF,
+    "HYMotionLoadNetwork": HYMotionLoadNetwork,
+    "HYMotionEncodeText": HYMotionEncodeText,
     "HYMotionGenerate": HYMotionGenerate,
     "HYMotionPreview": HYMotionPreview,
-    "HYMotionExportFBX": HYMotionExportFBX,
     "HYMotionSaveNPZ": HYMotionSaveNPZ,
+    "HYMotionExportFBX": HYMotionExportFBX,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "HYMotionLoadModel": "HY-Motion Load Model",
+    "HYMotionLoadLLM": "HY-Motion Load LLM",
+    "HYMotionLoadLLMGGUF": "HY-Motion Load LLM (GGUF)",
+    "HYMotionLoadNetwork": "HY-Motion Load Network",
+    "HYMotionEncodeText": "HY-Motion Encode Text",
     "HYMotionGenerate": "HY-Motion Generate",
     "HYMotionPreview": "HY-Motion Preview",
-    "HYMotionExportFBX": "HY-Motion Export FBX",
     "HYMotionSaveNPZ": "HY-Motion Save NPZ",
+    "HYMotionExportFBX": "HY-Motion Export FBX",
 }
