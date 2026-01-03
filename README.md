@@ -123,6 +123,8 @@ Interactive 3D animation preview with Three.js viewer.
 
 **This node provides a pure frontend GLB export that requires no additional Python dependencies.**
 
+> **Note**: This node does NOT automatically save files. You must manually click the "Export GLB" button in the viewer to download the animation file.
+
 ### HY-Motion Export FBX
 Export FBX file (requires fbxsdkpy installation).
 
