@@ -224,11 +224,20 @@
             frameInfoEl.textContent = `${Math.floor(currentTime * fps)} / ${totalFrames}`;
         }
 
-        window.addEventListener('resize', () => {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        });
+        // Handle resize with proper container dimensions
+        function handleResize() {
+            const container = document.getElementById('viewerContainer');
+            const width = container ? container.clientWidth : window.innerWidth;
+            const height = container ? container.clientHeight : window.innerHeight;
+            if (width > 0 && height > 0) {
+                camera.aspect = width / height;
+                camera.updateProjectionMatrix();
+                renderer.setSize(width, height);
+            }
+        }
+
+        // Handle browser window resize
+        window.addEventListener('resize', handleResize);
 
         // Load model data
         async function loadModelData(baseUrl) {
@@ -553,14 +562,16 @@
 
         // Message handling
         window.addEventListener('message', (event) => {
-            console.log('[HY-Motion Viewer] Received message:', event.data?.type);
             if (!parentOrigin && event.origin) parentOrigin = event.origin;
             if (event.data.type === 'LOAD_MOTION') {
                 loadMotion(event.data.motionData);
+            } else if (event.data.type === 'RESIZE') {
+                handleResize();
             }
         });
 
-        console.log('[HY-Motion Viewer] Ready');
+        // Initial resize to handle iframe embedding
+        handleResize();
         if (window.parent) {
             window.parent.postMessage({ type: 'VIEWER_READY' }, '*');
         }
